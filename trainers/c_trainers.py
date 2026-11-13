@@ -30,6 +30,7 @@ from logging import getLogger
 from time import time
 from setproctitle import setproctitle
 import gc
+from uuid import uuid4
 from django.utils import timezone
 from django.forms.models import model_to_dict
 from globals.c_globals import tf_workers
@@ -78,6 +79,8 @@ def decode_and_convert_image(myimage_bytes):
 from tools.c_spawn import spawn_process
 
 CHUNK_SIZE = 8
+INFERENCE_RESULT_TIMEOUT = 60.0
+INFERENCE_RESULT_ATTEMPTS = 3
 SCAN_INTERVAL = 10.0   # full periodic scan of all schools
 WAKE_POLL = 1.0        # how often the wake flag is checked
 SCHOOL_LOCK_TTL = 30   # seconds, per-school insert lock in redis
@@ -102,11 +105,12 @@ class trainer(spawn_process):
   async def update_predictions(self, school_nr, last_fit):
     if self.doing_reinference > 0 and self.doing_reinference != school_nr:
       return()
-    self.doing_reinference = school_nr
     with self.glob_lock:
       if trainers_redis.get_predict_proc_active(school_nr): 
         return()
       trainers_redis.set_predict_proc_active(school_nr, True)
+      self.doing_reinference = school_nr
+    request_id = None
     try:  
       from .models import trainframe
       from tf_workers.models import school
@@ -116,7 +120,7 @@ class trainer(spawn_process):
         .filter(school = school_nr, deleted=False)
         .exclude(last_fit = school_dbline.last_fit_infer))
       total_count = await base_qs.acount()
-      framelines = base_qs[:1000]
+      framelines = base_qs.order_by('id')[:1000]
       if self.got_sigint:
         return()  
       frames = []
@@ -141,6 +145,7 @@ class trainer(spawn_process):
           #self.logger.info('One Chunk is being predicted...')    
           imglist = []
           chunk_frames = []
+          skipped_frames = []
           for item in chunk:
             await asyncio.sleep(0)
             imagepath = school_dbline.dir + 'frames/' + item.name 
@@ -153,30 +158,59 @@ class trainer(spawn_process):
             except FileNotFoundError:
               self.logger.warning(
                 f'TR{self.id}: School #{school_nr}: {imagepath} not found'
-              )  
+              )
+              item.last_fit = school_dbline.last_fit_infer
+              skipped_frames.append(item)
+            except cv.error as error:
+              self.logger.warning(
+                f'TR{self.id}: School #{school_nr}: '
+                + f'{imagepath} could not be decoded: {error}'
+              )
+              item.last_fit = school_dbline.last_fit_infer
+              skipped_frames.append(item)
+          if skipped_frames:
+            await trainframe.objects.abulk_update(
+              skipped_frames,
+              ['last_fit'],
+            )
           if imglist:    
+            request_id = uuid4().hex
             await self.tf_worker.ask_pred(
               school_nr, 
               imglist, 
               self.tf_w_index,
+              request_id = request_id,
             )
           received = []
           for frameline in chunk_frames:
             await asyncio.sleep(0)
             if not received:
-              while True:
+              for attempt in range(INFERENCE_RESULT_ATTEMPTS):
                 received = await self.tf_worker.get_from_outqueue(
                   self.tf_w_index, 
-                  timeout = 60.0,
+                  timeout = INFERENCE_RESULT_TIMEOUT,
+                  request_id = request_id,
                 )
                 if received is None:
                   self.logger.warning(
-                    f'TR{self.id}: School #{school_nr}: Inferencing timeout'
+                    f'TR{self.id}: School #{school_nr}: '
+                    + f'Inferencing timeout ({attempt + 1}'
+                    + f'/{INFERENCE_RESULT_ATTEMPTS})'
                   )  
-                  await a_break_type(BR_LONG)
                 else:
-                  received = received.tolist()  
+                  received = received.tolist()
                   break
+              if received is None:
+                await self.tf_worker.finish_request(
+                  self.tf_w_index,
+                  request_id,
+                )
+                request_id = None
+                self.logger.error(
+                  f'TR{self.id}: School #{school_nr}: '
+                  + 'Abandoning inference batch after repeated timeouts'
+                )
+                return()
             prediction = received.pop(0) 
             frameline.last_fit = school_dbline.last_fit_infer
             for i in range(10):
@@ -185,19 +219,35 @@ class trainer(spawn_process):
             chunk_frames,
             ["last_fit"] + [f"pred{i}" for i in range(10)],
           )
+          if request_id is not None:
+            await self.tf_worker.finish_request(
+              self.tf_w_index,
+              request_id,
+            )
+            request_id = None
           if self.dbline.inference_brake:
             await a_break_time((time() - ts1) * self.dbline.inference_brake)
         if len(frames) >= total_count:  
-          trainers_redis.set_predict_proc_started(school_nr, False)
           self.logger.info(
             f'TR{self.id}: Finished re-inferencing {total_count} frames '
             + f'of school #{school_nr}'
-          )  
-          self.doing_reinference = 0
-      else:    
-        self.doing_reinference = 0
+          )
     finally:
-      trainers_redis.set_predict_proc_active(school_nr, False)
+      try:
+        if request_id is not None:
+          await self.tf_worker.finish_request(
+            self.tf_w_index,
+            request_id,
+          )
+      finally:
+        try:
+          trainers_redis.set_predict_proc_active(school_nr, False)
+        finally:
+          try:
+            trainers_redis.set_predict_proc_started(school_nr, False)
+          finally:
+            if self.doing_reinference == school_nr:
+              self.doing_reinference = 0
               
   async def async_runner(self): 
     try:

@@ -98,18 +98,18 @@ class model_buffer():
     self.xdim = xdim
     self.ydim = ydim
 
-  async def append(self, initem, prio):
-    # structure of initem:
-    # initem[0] = userindex, schoolnr, initem[1] = np.image, initem[2] = np.image...
+  async def append(self, initem, prio, request_id = None, frame_start = 2):
+    # initem[0] = userindex, initem[1] = schoolnr, image frames start at frame_start.
     # structure of outitem:
     # outitem[0] = np.image, outitem[1] = userindex
     if self.pause:
       await a_break_type(BR_LONG)
       return()
-    for frame in initem[2:]:
+    route = (initem[0], request_id) if request_id is not None else initem[0]
+    for frame in initem[frame_start:]:
       if frame.shape[1] != self.xdim or  frame.shape[0] != self.ydim:
         frame = await asyncio.to_thread(cv.resize, frame, (self.xdim, self.ydim))
-      await self.queues[prio].put((frame, initem[0]))
+      await self.queues[prio].put((frame, route))
 
   async def get(self, maxcount):
     prios_with_jobs = [i for i in range(10) if not self.queues[i].empty()]
@@ -226,7 +226,12 @@ class tf_worker(spawn_process):
     elif (received[0] == 'ask_pred'):
       schoolnr = received[2]
       await self.check_model(schoolnr, self.logger, True)
-      if len(received) == 3: #no images
+      request_id = None
+      frame_start = 3
+      if len(received) > 3 and isinstance(received[3], str):
+        request_id = received[3]
+        frame_start = 4
+      if len(received) == 3 or len(received) == frame_start: #no images
         return(True)
       # Wait for the model dimensions, but never forever: if the model
       # failed to load (bad download, defective file), waiting here would
@@ -248,7 +253,12 @@ class tf_worker(spawn_process):
         return(True)
       async with self.users_lock:
         prio = user.prio
-      await self.model_buffers[schoolnr].append(received[1:], prio)
+      await self.model_buffers[schoolnr].append(
+        received[1:],
+        prio,
+        request_id = request_id,
+        frame_start = frame_start - 1,
+      )
     elif (received[0] == 'register'):
       myuser = tf_user(prio = received[1])
       async with self.users_lock:
@@ -590,10 +600,12 @@ class tf_worker(spawn_process):
       for i in range(len(framelist)):
         if ((i == len(framelist) - 1) 
             or (framesinfo[i] != framesinfo[i+1])):
-          await self.my_output.put(framesinfo[starting], (
+          route = framesinfo[starting]
+          userindex = route[0] if isinstance(route, tuple) else route
+          await self.my_output.put(userindex, (
             'pred_to_send', 
             predictions[starting:i+1], 
-            framesinfo[starting],
+            route,
           ))
           starting = i + 1
       if self.do_tf_debug:
@@ -627,6 +639,7 @@ class tf_worker_client():
     self.run_out_procs = {}
     self.pred_out_dict = {}
     self.pred_out_lock = asyncio.Lock()
+    self.correlated_requests = set()
     self.is_ready = None
     self.auto_break = a_break_auto(tmin = 0.01, tmax = 0.1, rate = 0.01)
     self.prio_dict = {}
@@ -643,12 +656,16 @@ class tf_worker_client():
         elif (received[0] == 'put_xy'):
           self.xy = received[1]
         elif (received[0] == 'pred_to_send'):
+          response_key = received[2]
           while True:
             async with self.pred_out_lock:
-              if received[2] not in self.pred_out_dict:
-                self.pred_out_dict[received[2]] = None
-              if self.pred_out_dict[received[2]] is None:
-                self.pred_out_dict[received[2]] = received[1]
+              if (isinstance(response_key, tuple)
+                  and response_key not in self.correlated_requests):
+                break
+              if response_key not in self.pred_out_dict:
+                self.pred_out_dict[response_key] = None
+              if self.pred_out_dict[response_key] is None:
+                self.pred_out_dict[response_key] = received[1]
                 self.auto_break.reset()
                 break
             await self.auto_break.wait() 
@@ -688,12 +705,16 @@ class tf_worker_client():
       self.auto_break.reset()  
     return(self.is_ready)
 
-  async def ask_pred(self, school, image_list, tf_w_index):
+  async def ask_pred(self, school, image_list, tf_w_index, request_id = None):
     if self.prio_dict[self.tf_w_index] < 6:
       tf_workers_redis.set_last_prio_write()
     command_line = ['ask_pred', tf_w_index, school, ]
+    if request_id is not None:
+      self.correlated_requests.add((tf_w_index, request_id))
+      command_line.append(request_id)
     command_line += image_list
     await self.inqueue.put(command_line)
+    return(request_id)
 
   async def outqueue_empty(self, userindex):
     async with self.pred_out_lock:
@@ -701,18 +722,29 @@ class tf_worker_client():
         or (self.pred_out_dict[userindex] is None))
     return(result)
 
-  async def get_from_outqueue(self, userindex, timeout = None):
+  async def get_from_outqueue(
+      self, userindex, timeout = None, request_id = None):
     ts = time()
+    response_key = (
+      (userindex, request_id) if request_id is not None else userindex
+    )
     while True:
       async with self.pred_out_lock: 
-        if userindex in self.pred_out_dict and self.pred_out_dict[userindex] is not None:
-          result = self.pred_out_dict[userindex]
-          self.pred_out_dict[userindex] = None
+        if (response_key in self.pred_out_dict
+            and self.pred_out_dict[response_key] is not None):
+          result = self.pred_out_dict[response_key]
+          self.pred_out_dict[response_key] = None
           self.auto_break.reset()  
           return(result)
       if timeout and time() - ts >= timeout:
         return(None)
       await self.auto_break.wait()   
+
+  async def finish_request(self, userindex, request_id):
+    response_key = (userindex, request_id)
+    async with self.pred_out_lock:
+      self.correlated_requests.discard(response_key)
+      self.pred_out_dict.pop(response_key, None)
 
   async def stop_out(self, index):
     await self.my_output.put(index, ('stop',))
